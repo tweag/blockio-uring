@@ -65,9 +65,9 @@ common language
 library
   import:            language, warnings
   exposed-modules:   System.IO.BlockIO
+                   , System.IO.BlockIO.URing
   hs-source-dirs:    src
   other-modules:
-    System.IO.BlockIO.URing
     System.IO.BlockIO.URingFFI
 
   build-depends:

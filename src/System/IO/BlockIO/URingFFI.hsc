@@ -124,7 +124,6 @@ foreign import capi unsafe "liburing.h io_uring_prep_sync_file_range"
 foreign import capi unsafe "liburing.h io_uring_submit"
   io_uring_submit :: Ptr URing -> IO CInt
 
-
 --
 -- Collecting I/O
 --

@@ -13,7 +13,7 @@ module System.IO.BlockIO (
 
     -- * Performing I\/O
     submitIO,
-    IOOp(IOOpRead, IOOpWrite, IOOpReadV, IOOpWriteV, IOOpFsync, IOOpSyncFileRange),
+    IOOp(IOOpRead, IOOpReadPtr, IOOpWrite, IOOpWritePtr, IOOpReadV, IOOpReadVPtr, IOOpWriteV, IOOpWriteVPtr, IOOpFsync, IOOpSyncFileRange),
     IOResult(IOResult, IOError),
     ByteCount, Errno(..),
 
@@ -44,7 +44,7 @@ import System.IO.Error
 import GHC.IO.Exception (IOErrorType(ResourceVanished, InvalidArgument))
 import GHC.Conc.Sync (labelThread)
 
-import Foreign.Ptr (plusPtr, castPtr)
+import Foreign.Ptr (plusPtr, castPtr, Ptr)
 import Foreign.Storable (sizeOf, pokeElemOff)
 import Foreign.C.Error (Errno(..))
 import System.Posix.Types (Fd (..), FileOffset, ByteCount)
@@ -265,8 +265,14 @@ closeIOCapCtx IOCapCtx {ioctxURing, ioctxCloseSync} = do
 -- errors if it finds any that are not pinned.
 data IOOp s = IOOpRead   !Fd !FileOffset !(MutableByteArray s) !Int !ByteCount
             | IOOpWrite  !Fd !FileOffset !(MutableByteArray s) !Int !ByteCount
+            | IOOpReadPtr !Fd !FileOffset !(Ptr ()) !Int !ByteCount
+            | IOOpWritePtr !Fd !FileOffset !(Ptr ()) !Int !ByteCount
+
             | IOOpReadV  !Fd !FileOffset !(V.Vector (MutableByteArray s, Int, ByteCount))
             | IOOpWriteV !Fd !FileOffset !(V.Vector (MutableByteArray s, Int, ByteCount))
+            | IOOpReadVPtr !Fd !FileOffset !(V.Vector (Ptr (), Int, ByteCount))
+            | IOOpWriteVPtr !Fd !FileOffset !(V.Vector (Ptr (), Int, ByteCount))
+
             | IOOpFsync  !Fd !Int
             | IOOpSyncFileRange !Fd !FileOffset !ByteCount !Int
 
@@ -413,6 +419,16 @@ prepAndSubmitIOBatch IOCapCtx {
                               (mutableByteArrayContents buf `plusPtr` bufOff)
                               cnt (packIOOpId iobatchIx ioopix)
             pure Nothing
+          IOOpReadPtr  fd off buf bufOff cnt -> do
+            URing.prepareRead  uring fd off
+                              (buf `plusPtr` bufOff)
+                              cnt (packIOOpId iobatchIx ioopix)
+            pure Nothing
+          IOOpWritePtr fd off buf bufOff cnt -> do
+            URing.prepareWrite uring fd off
+                              (buf `plusPtr` bufOff)
+                              cnt (packIOOpId iobatchIx ioopix)
+            pure Nothing
           IOOpReadV fd off segs -> do
             V.forM_ segs $ \(buf, _, _) -> guardPinned buf
             iovecs <- mkIOVecs segs
@@ -423,6 +439,18 @@ prepAndSubmitIOBatch IOCapCtx {
           IOOpWriteV fd off segs -> do
             V.forM_ segs $ \(buf, _, _) -> guardPinned buf
             iovecs <- mkIOVecs segs
+            URing.prepareWriteV uring fd off
+                              (castPtr (mutableByteArrayContents iovecs))
+                              (V.length segs) (packIOOpId iobatchIx ioopix)
+            pure (Just iovecs)
+          IOOpReadVPtr fd off segs -> do
+            iovecs <- mkIOVecsPtr segs
+            URing.prepareReadV uring fd off
+                              (castPtr (mutableByteArrayContents iovecs))
+                              (V.length segs) (packIOOpId iobatchIx ioopix)
+            pure (Just iovecs)
+          IOOpWriteVPtr fd off segs -> do
+            iovecs <- mkIOVecsPtr segs
             URing.prepareWriteV uring fd off
                               (castPtr (mutableByteArrayContents iovecs))
                               (V.length segs) (packIOOpId iobatchIx ioopix)
@@ -470,6 +498,17 @@ prepAndSubmitIOBatch IOCapCtx {
         V.iforM_ segs $ \i (buf, bufOff, cnt) ->
           pokeElemOff ptr i FFI.IOVec {
               FFI.iov_base = mutableByteArrayContents buf `plusPtr` bufOff,
+              FFI.iov_len  = cnt
+            }
+        return iovecArr
+
+    mkIOVecsPtr segs = do
+        let nsegs = V.length segs
+        iovecArr <- newPinnedByteArray (nsegs * sizeOf (undefined :: FFI.IOVec))
+        let ptr = castPtr (mutableByteArrayContents iovecArr)
+        V.iforM_ segs $ \i (buf, bufOff, cnt) ->
+          pokeElemOff ptr i FFI.IOVec {
+              FFI.iov_base = buf `plusPtr` bufOff,
               FFI.iov_len  = cnt
             }
         return iovecArr
