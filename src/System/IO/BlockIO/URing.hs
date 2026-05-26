@@ -11,11 +11,19 @@ module System.IO.BlockIO.URing (
     IOOpId(..),
     prepareRead,
     prepareWrite,
+    prepareReadV,
+    prepareWriteV,
     prepareNop,
+    prepareFsync,
+    prepareSyncFileRange,
     submitIO,
     IOCompletion(..),
     IOResult(IOResult, IOError),
     awaitIO,
+    iORING_FSYNC_DATASYNC,
+    iORING_SYNC_FILE_RANGE_WAIT_BEFORE,
+    iORING_SYNC_FILE_RANGE_WRITE,
+    iORING_SYNC_FILE_RANGE_WAIT_AFTER,
   ) where
 
 import qualified Data.Vector.Generic as VG
@@ -125,6 +133,22 @@ prepareWrite URing {uringptr} fd off buf len (IOOpId ioopid) = do
     FFI.io_uring_prep_write sqeptr fd buf (fromIntegral len) (fromIntegral off)
     FFI.io_uring_sqe_set_data sqeptr (fromIntegral ioopid)
 
+prepareReadV :: URing -> Fd -> FileOffset -> Ptr FFI.IOVec -> Int -> IOOpId -> IO ()
+prepareReadV URing {uringptr} fd off iovecs nvecs (IOOpId ioopid) = do
+    sqeptr <- throwErrResIfNull "prepareReadV" fullErrorType
+                                "URing I/O queue full" $
+      FFI.io_uring_get_sqe uringptr
+    FFI.io_uring_prep_readv sqeptr fd iovecs (fromIntegral nvecs) (fromIntegral off)
+    FFI.io_uring_sqe_set_data sqeptr (fromIntegral ioopid)
+
+prepareWriteV :: URing -> Fd -> FileOffset -> Ptr FFI.IOVec -> Int -> IOOpId -> IO ()
+prepareWriteV URing {uringptr} fd off iovecs nvecs (IOOpId ioopid) = do
+    sqeptr <- throwErrResIfNull "prepareWriteV" fullErrorType
+                                "URing I/O queue full" $
+      FFI.io_uring_get_sqe uringptr
+    FFI.io_uring_prep_writev sqeptr fd iovecs (fromIntegral nvecs) (fromIntegral off)
+    FFI.io_uring_sqe_set_data sqeptr (fromIntegral ioopid)
+
 prepareNop :: URing -> IOOpId -> IO ()
 prepareNop URing {uringptr} (IOOpId ioopid) = do
     sqeptr <- throwErrResIfNull "prepareNop" fullErrorType
@@ -133,11 +157,39 @@ prepareNop URing {uringptr} (IOOpId ioopid) = do
     FFI.io_uring_prep_nop sqeptr
     FFI.io_uring_sqe_set_data sqeptr (fromIntegral ioopid)
 
+iORING_FSYNC_DATASYNC :: Int
+iORING_FSYNC_DATASYNC = 1 
+
+prepareFsync :: URing -> Fd -> Int -> IOOpId -> IO ()
+prepareFsync URing {uringptr} fd flag (IOOpId ioopid) = do
+    sqeptr <- throwErrResIfNull "prepareFsync" fullErrorType
+                                "URing I/O queue full" $
+      FFI.io_uring_get_sqe uringptr
+    FFI.io_uring_prep_fsync sqeptr fd (fromIntegral flag)
+    FFI.io_uring_sqe_set_data sqeptr (fromIntegral ioopid)
+
+iORING_SYNC_FILE_RANGE_WAIT_BEFORE :: Int
+iORING_SYNC_FILE_RANGE_WAIT_BEFORE = 1
+
+iORING_SYNC_FILE_RANGE_WRITE :: Int
+iORING_SYNC_FILE_RANGE_WRITE = 2
+
+iORING_SYNC_FILE_RANGE_WAIT_AFTER :: Int
+iORING_SYNC_FILE_RANGE_WAIT_AFTER = 4
+
+prepareSyncFileRange :: URing -> Fd -> FileOffset -> ByteCount -> Int -> IOOpId -> IO ()
+prepareSyncFileRange URing {uringptr} fd off len flags (IOOpId ioopid) = do
+    sqeptr <- throwErrResIfNull "prepareSyncFileRange" fullErrorType
+                                "URing I/O queue full" $
+      FFI.io_uring_get_sqe uringptr
+    FFI.io_uring_prep_sync_file_range sqeptr fd (fromIntegral len)
+                                      (fromIntegral off) (fromIntegral flags)
+    FFI.io_uring_sqe_set_data sqeptr (fromIntegral ioopid)
+
 submitIO :: URing -> IO ()
 submitIO URing {uringptr} =
     throwErrnoResIfNegRetry_ "submitIO" $
       FFI.io_uring_submit uringptr
-
 
 --
 -- Types for completing I/O

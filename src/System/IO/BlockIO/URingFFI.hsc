@@ -89,8 +89,37 @@ foreign import capi unsafe "liburing.h io_uring_prep_read"
 foreign import capi unsafe "liburing.h io_uring_prep_write"
   io_uring_prep_write :: Ptr URingSQE -> Fd -> Ptr Word8 -> CUInt -> CULong -> IO ()
 
+data {-# CTYPE "liburing.h" "struct iovec" #-}
+     IOVec = IOVec {
+               iov_base :: !(Ptr Word8),
+               iov_len  :: !CSize
+             }
+  deriving stock (Show, Eq)
+
+instance Storable IOVec where
+  sizeOf    _ = #{size      struct iovec}
+  alignment _ = #{alignment struct iovec}
+  peek      p = do iov_base <- #{peek struct iovec, iov_base} p
+                   iov_len  <- #{peek struct iovec, iov_len}  p
+                   return IOVec { iov_base, iov_len }
+  poke      p (IOVec {iov_base, iov_len}) = do
+    #{poke struct iovec, iov_base} p iov_base
+    #{poke struct iovec, iov_len}  p iov_len
+
+foreign import capi unsafe "liburing.h io_uring_prep_readv"
+  io_uring_prep_readv :: Ptr URingSQE -> Fd -> Ptr IOVec -> CUInt -> CULong -> IO ()
+
+foreign import capi unsafe "liburing.h io_uring_prep_writev"
+  io_uring_prep_writev :: Ptr URingSQE -> Fd -> Ptr IOVec -> CUInt -> CULong -> IO ()
+
 foreign import capi unsafe "liburing.h io_uring_prep_nop"
   io_uring_prep_nop :: Ptr URingSQE -> IO ()
+
+foreign import capi unsafe "liburing.h io_uring_prep_fsync"
+  io_uring_prep_fsync :: Ptr URingSQE -> Fd -> CUInt -> IO ()
+
+foreign import capi unsafe "liburing.h io_uring_prep_sync_file_range"
+  io_uring_prep_sync_file_range :: Ptr URingSQE -> Fd -> CUInt -> CULong -> CInt -> IO ()
 
 foreign import capi unsafe "liburing.h io_uring_submit"
   io_uring_submit :: Ptr URing -> IO CInt

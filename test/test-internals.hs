@@ -6,7 +6,8 @@ module Main (main) where
 
 
 import           Data.Proxy
-import           Data.Word                  (Word64)
+import           Data.Word                  (Word64, Word8)
+import           Foreign.Ptr                (Ptr, wordPtrToPtr)
 import           System.IO.BlockIO.URing
 import qualified System.IO.BlockIO.URingFFI as FFI
 import           Test.QuickCheck.Classes
@@ -22,6 +23,7 @@ tests = testGroup "test-internals" [
       testCase "example_simpleNoop 1" $ example_simpleNoop 1
     , testCase "example_simpleNoop maxBound" $ example_simpleNoop maxBound
     , testClassLaws "URingParams" $ storableLaws (Proxy @FFI.URingParams)
+    , testClassLaws "IOVec" $ storableLaws (Proxy @FFI.IOVec)
     ]
 
 example_simpleNoop :: Word64 -> Assertion
@@ -59,3 +61,10 @@ instance Arbitrary FFI.URingParams where
       FFI.URingParams a' b' c' d'
     | (a', b', c', d') <- shrink (a, b, c, d)
     ]
+
+instance Arbitrary FFI.IOVec where
+  arbitrary = FFI.IOVec <$> genPtr <*> (fromIntegral <$> (arbitrary :: Gen Word64))
+  shrink (FFI.IOVec b l) = [ FFI.IOVec b l' | l' <- shrink l ]
+
+genPtr :: Gen (Ptr Word8)
+genPtr = wordPtrToPtr . fromIntegral <$> (arbitrary :: Gen Word64)

@@ -13,10 +13,15 @@ module System.IO.BlockIO (
 
     -- * Performing I\/O
     submitIO,
-    IOOp(IOOpRead, IOOpWrite),
+    IOOp(IOOpRead, IOOpWrite, IOOpReadV, IOOpWriteV, IOOpFsync, IOOpSyncFileRange),
     IOResult(IOResult, IOError),
     ByteCount, Errno(..),
 
+    -- * Flags
+    URing.iORING_FSYNC_DATASYNC,
+    URing.iORING_SYNC_FILE_RANGE_WAIT_BEFORE,
+    URing.iORING_SYNC_FILE_RANGE_WRITE,
+    URing.iORING_SYNC_FILE_RANGE_WAIT_AFTER
   ) where
 
 import Data.Bits
@@ -39,13 +44,15 @@ import System.IO.Error
 import GHC.IO.Exception (IOErrorType(ResourceVanished, InvalidArgument))
 import GHC.Conc.Sync (labelThread)
 
-import Foreign.Ptr (plusPtr)
+import Foreign.Ptr (plusPtr, castPtr)
+import Foreign.Storable (sizeOf, pokeElemOff)
 import Foreign.C.Error (Errno(..))
 import System.Posix.Types (Fd (..), FileOffset, ByteCount)
 import System.Posix.Internals (hostIsThreaded)
 
 import qualified System.IO.BlockIO.URing as URing
 import           System.IO.BlockIO.URing (IOResult(..))
+import qualified System.IO.BlockIO.URingFFI as FFI
 
 -- | IO context: a handle used by threads submitting IO batches.
 --
@@ -256,8 +263,12 @@ closeIOCapCtx IOCapCtx {ioctxURing, ioctxCloseSync} = do
 -- these buffers are passed to @io_uring@, and the buffers must therefore not be
 -- moved around. 'submitIO' will check that buffers are pinned, and will throw
 -- errors if it finds any that are not pinned.
-data IOOp s = IOOpRead  !Fd !FileOffset !(MutableByteArray s) !Int !ByteCount
-            | IOOpWrite !Fd !FileOffset !(MutableByteArray s) !Int !ByteCount
+data IOOp s = IOOpRead   !Fd !FileOffset !(MutableByteArray s) !Int !ByteCount
+            | IOOpWrite  !Fd !FileOffset !(MutableByteArray s) !Int !ByteCount
+            | IOOpReadV  !Fd !FileOffset !(V.Vector (MutableByteArray s, Int, ByteCount))
+            | IOOpWriteV !Fd !FileOffset !(V.Vector (MutableByteArray s, Int, ByteCount))
+            | IOOpFsync  !Fd !Int
+            | IOOpSyncFileRange !Fd !FileOffset !ByteCount !Int
 
 -- | Submit a batch of I\/O operations, and wait for them all to complete.
 -- The sequence of results matches up with the sequence of operations.
@@ -388,17 +399,40 @@ prepAndSubmitIOBatch IOCapCtx {
       -- so we may still need to release the mvar on exception.
       flip onException (putMVar ioctxURing muring) $ do
         uring <- maybe (throwIO closed) pure muring
-        V.iforM_ iobatch $ \ioopix ioop -> case ioop of
+        -- Collect iovecs keep alives while preparing operations
+        iovecKeepAlives <- V.iforM iobatch $ \ioopix ioop -> case ioop of
           IOOpRead  fd off buf bufOff cnt -> do
             guardPinned buf
             URing.prepareRead  uring fd off
                               (mutableByteArrayContents buf `plusPtr` bufOff)
                               cnt (packIOOpId iobatchIx ioopix)
+            pure Nothing
           IOOpWrite fd off buf bufOff cnt -> do
             guardPinned buf
             URing.prepareWrite uring fd off
                               (mutableByteArrayContents buf `plusPtr` bufOff)
                               cnt (packIOOpId iobatchIx ioopix)
+            pure Nothing
+          IOOpReadV fd off segs -> do
+            V.forM_ segs $ \(buf, _, _) -> guardPinned buf
+            iovecs <- mkIOVecs segs
+            URing.prepareReadV uring fd off
+                              (castPtr (mutableByteArrayContents iovecs))
+                              (V.length segs) (packIOOpId iobatchIx ioopix)
+            pure (Just iovecs)
+          IOOpWriteV fd off segs -> do
+            V.forM_ segs $ \(buf, _, _) -> guardPinned buf
+            iovecs <- mkIOVecs segs
+            URing.prepareWriteV uring fd off
+                              (castPtr (mutableByteArrayContents iovecs))
+                              (V.length segs) (packIOOpId iobatchIx ioopix)
+            pure (Just iovecs)
+          IOOpFsync fd flag -> do
+            URing.prepareFsync uring fd flag (packIOOpId iobatchIx ioopix)
+            pure Nothing
+          IOOpSyncFileRange fd off len flags -> do
+            URing.prepareSyncFileRange uring fd off len flags (packIOOpId iobatchIx ioopix)
+            pure Nothing
         -- TODO: if submitIO or guardPinned throws an exception, we need to
         -- undo / clear the SQEs that we prepared.
         URing.submitIO uring
@@ -414,7 +448,10 @@ prepAndSubmitIOBatch IOCapCtx {
                     iobatchIx,
                     iobatchOpCount,
                     iobatchCompletion,
-                    iobatchKeepAlives = iobatch
+                    iobatchKeepAlives = IOBatchKeepAlives {
+                        iobkaIOOps  = iobatch,
+                        iobkaIOVecs = V.mapMaybe id iovecKeepAlives
+                      }
                   }
         putMVar ioctxURing muring
   where
@@ -422,14 +459,38 @@ prepAndSubmitIOBatch IOCapCtx {
     closed    = mkIOError ResourceVanished "IOCtx closed" Nothing Nothing
     notPinned = mkIOError InvalidArgument "MutableByteArray is unpinned" Nothing Nothing
 
+    -- | Prepare the array of iovecs with 'IOOpReadV'\/'IOOpWriteV' buffers.
+    -- This array does not depend on the caller and only for the internal need.
+    mkIOVecs :: V.Vector (MutableByteArray RealWorld, Int, ByteCount)
+             -> IO (MutableByteArray RealWorld)
+    mkIOVecs segs = do
+        let nsegs = V.length segs
+        iovecArr <- newPinnedByteArray (nsegs * sizeOf (undefined :: FFI.IOVec))
+        let ptr = castPtr (mutableByteArrayContents iovecArr)
+        V.iforM_ segs $ \i (buf, bufOff, cnt) ->
+          pokeElemOff ptr i FFI.IOVec {
+              FFI.iov_base = mutableByteArrayContents buf `plusPtr` bufOff,
+              FFI.iov_len  = cnt
+            }
+        return iovecArr
+
 data IOBatch = IOBatch {
                  iobatchIx         :: !IOBatchIx,
                  iobatchOpCount    :: !Int,
                  iobatchCompletion :: !(MVar (VU.Vector IOResult)),
+                 iobatchKeepAlives :: !IOBatchKeepAlives
+               }
+
+-- | The heap objects that must be kept alive for the duration of a batch's
+-- I\/O operations to avoid reading from or writing into outdated buffers.
+data IOBatchKeepAlives = IOBatchKeepAlives {
                  -- | The list of I\/O operations is sent to the completion
                  -- thread so that the buffers are kept alive while the kernel
                  -- is using them.
-                 iobatchKeepAlives :: V.Vector (IOOp RealWorld)
+                 iobkaIOOps  :: !(V.Vector (IOOp RealWorld)),
+                 -- | The iovec arrays built for 'IOOpReadV'\/'IOOpWriteV'
+                 -- operations in this batch.
+                 iobkaIOVecs :: !(V.Vector (MutableByteArray RealWorld))
                }
 
 -- | We submit and processes the completions in batches. This is the index into
@@ -482,14 +543,15 @@ unpackIOOpId (URing.IOOpId w64) =
 -- The 'completions' array keeps track (per batch) of the completion MVar used
 -- to communicate the batch result back to the thread that submitted the batch.
 --
--- The 'keepAlives' array ensures (per batch) that certain heap objects are kept
+-- The 'keepAlives' value ensures (per batch) that certain heap objects are kept
 -- live for the duration of the I/O operations in the batch. Specifically, it is
 -- the I/O buffers for each operation that we must keep live (otherwise if they
 -- were GC'd the kernel could scribble on top of whatever got placed there
 -- next). We reuse the original vector of IOOps that was submitted since this
 -- conveniently exists anyway and it contains the IOOps which themselves contain
--- the I/O buffers. The 'keepAlives' entries are overwritten with 'invalidEntry'
--- once they are no longer needed.
+-- the I/O buffers. Also, we keep alive the iovec arrays built for 'IOOpReadV'
+-- and 'IOOpWriteV' operations. The 'keepAlives' entries are overwritten with
+-- 'invalidEntry' once they are no longer needed.
 --
 -- Algorithm outline:
 -- + wait for single IO result
@@ -516,7 +578,7 @@ completionThread !uring !done !maxc !qsem !chaniobatch !chaniobatchix = do
     collectCompletion :: VUM.MVector RealWorld Int
                       -> VM.MVector  RealWorld (VUM.MVector RealWorld IOResult)
                       -> VM.MVector  RealWorld (MVar (VU.Vector IOResult))
-                      -> VM.MVector  RealWorld (V.Vector (IOOp RealWorld))
+                      -> VM.MVector  RealWorld IOBatchKeepAlives
                       -> IO ()
     collectCompletion !counts !results !completions !keepAlives = do
       iocompletion <- URing.awaitIO uring

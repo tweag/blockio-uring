@@ -5,14 +5,18 @@
 module Main (main) where
 
 import           Control.Exception        (Exception (displayException),
-                                           IOException, SomeException, try)
-import           Control.Monad            (void)
+                                           IOException, SomeException, finally,
+                                           try)
+import           Control.Monad            (void, zipWithM_)
 import           Data.List                (isPrefixOf)
 import qualified Data.Primitive.ByteArray as P
 import qualified Data.Vector              as V
+import qualified Data.Vector.Unboxed      as VU
+import           Data.Word                (Word8)
 import           GHC.IO.Exception         (IOException (ioe_location))
 import           GHC.IO.FD                (FD (..))
 import           GHC.IO.Handle.FD         (handleToFd)
+import           System.Directory         (removeFile)
 import           System.IO
 import           System.IO.BlockIO
 import           Test.Tasty
@@ -28,6 +32,9 @@ tests = testGroup "test"
     , testCase "example_initReadClose 32" $ example_initReadClose 32
     , testCase "example_initReadClose 96" $ example_initReadClose 96
     , testCase "example_initReadClose 200" $ example_initReadClose 200
+    , testCase "example_initWriteClose" $ example_initWriteClose
+    , testCase "example_initReadVClose" example_initReadVClose
+    , testCase "example_initWriteVClose" example_initWriteVClose
     , testCase "example_initEmptyClose" example_initEmptyClose
     , testCase "example_closeIsIdempotent" example_closeIsIdempotent
     , testProperty "prop_ValidIOCtxParams" prop_ValidIOCtxParams
@@ -48,6 +55,59 @@ example_initReadClose size = do
         void $ submitIO ctx $ V.replicate size $
             IOOpRead fd 0 mba 0 10
     closeIOCtx ctx
+
+example_initWriteClose :: Assertion
+example_initWriteClose = do
+    ctx <- initIOCtx defaultIOCtxParams
+    (path, hdl0) <- openTempFile "." "write-test"
+    hClose hdl0
+    (`finally` removeFile path) $ do
+        withFile path ReadWriteMode $ \hdl -> do
+            FD { fdFD = fromIntegral -> fd } <- handleToFd hdl
+            mba <- P.newPinnedByteArray 10
+            zipWithM_ (P.writeByteArray mba) [0..] (bytesOf "HelloWorld")
+            results <- submitIO ctx $ V.singleton $
+                IOOpWrite fd 0 mba 0 10
+            VU.mapM_ (IOResult 10 @=?) results
+        closeIOCtx ctx
+        actual <- readFile path
+        "HelloWorld" @=? take 10 actual
+
+example_initReadVClose :: Assertion
+example_initReadVClose = do
+    ctx <- initIOCtx defaultIOCtxParams
+    expected <- readFile "blockio-uring.cabal"
+    withFile "blockio-uring.cabal" ReadMode $ \hdl -> do
+        FD { fdFD = fromIntegral -> fd } <- handleToFd hdl
+        mba1 <- P.newPinnedByteArray 10
+        mba2 <- P.newPinnedByteArray 10
+        results <- submitIO ctx $ V.singleton $
+            IOOpReadV fd 0 (V.fromList [(mba1, 0, 10), (mba2, 0, 10)])
+        VU.mapM_ (IOResult 20 @=?) results
+        bytes1 <- mapM (P.readByteArray mba1) [0..9]
+        bytes2 <- mapM (P.readByteArray mba2) [0..9]
+        let actual = map (toEnum . fromIntegral) (bytes1 ++ bytes2 :: [Word8])
+        take 20 expected @=? actual
+    closeIOCtx ctx
+
+example_initWriteVClose :: Assertion
+example_initWriteVClose = do
+    ctx <- initIOCtx defaultIOCtxParams
+    (path, hdl0) <- openTempFile "." "writev-test"
+    hClose hdl0
+    (`finally` removeFile path) $ do
+        withFile path ReadWriteMode $ \hdl -> do
+            FD { fdFD = fromIntegral -> fd } <- handleToFd hdl
+            mba1 <- P.newPinnedByteArray 5
+            mba2 <- P.newPinnedByteArray 5
+            zipWithM_ (P.writeByteArray mba1) [0..] (bytesOf "Hello")
+            zipWithM_ (P.writeByteArray mba2) [0..] (bytesOf "World")
+            results <- submitIO ctx $ V.singleton $
+                IOOpWriteV fd 0 (V.fromList [(mba1, 0, 5), (mba2, 0, 5)])
+            VU.mapM_ (IOResult 10 @=?) results
+        closeIOCtx ctx
+        actual <- readFile path
+        "HelloWorld" @=? take 10 actual
 
 example_initEmptyClose :: Assertion
 example_initEmptyClose = do
@@ -138,3 +198,6 @@ shrinkNonNegativeInt x = [ x' | NonNegative x' <- shrink (NonNegative x) ]
 minValue, maxValue :: Int
 minValue = 0
 maxValue = 2^maxExponent
+
+bytesOf :: String -> [Word8]
+bytesOf = map (fromIntegral . fromEnum)
